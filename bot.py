@@ -1,96 +1,78 @@
 import os
 import discord
-from discord import app_commands
 from dotenv import load_dotenv
 from openai import OpenAI
-import feedparser
 
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-client = discord.Client(intents=discord.Intents.default())
-tree = app_commands.CommandTree(client)
+# メッセージ内容を読むために intent を有効化
+intents = discord.Intents.default()
+intents.message_content = True
+
+client = discord.Client(intents=intents)
 ai = OpenAI(api_key=OPENAI_API_KEY)
 
+# チャンネル単位の簡易会話履歴
+conversation = {}  # {channel_id: [ {role, content}, ... ]}
 
-# ----------- 乃木坂ニュース取得(RSS) -----------
-def fetch_nogi_news():
-    RSS_URL = "https://nogizaka46.com/s/n46/?ima=0000&ct=news"  # 公式RSSではないが検知用URL
-    FEED_URL = "https://news.yahoo.co.jp/rss/media/nogizakarf/all.xml"
+SYSTEM_PROMPT = (
+    "あなたはDiscord上でユーザーと自然に会話するアシスタントです。"
+    "日本語で、会話的に返してください。"
+    "乃木坂46の話題にも強いですが、一般の質問にも答えます。"
+)
 
-    feed = feedparser.parse(FEED_URL)
+MAX_TURNS = 12  # 直近の履歴だけ保持（コスト抑制）
 
-    articles = []
-    for entry in feed.entries[:5]:
-        articles.append({
-            "title": entry.title,
-            "snippet": entry.summary,
-            "url": entry.link
-        })
-
-    return articles
-
-
-# ----------- 要約機能（GPT-4.1） -----------
-def summarize_articles(articles):
-    text = ""
-    for a in articles:
-        text += f"■ {a['title']}\n{a['snippet']}\nURL: {a['url']}\n\n"
-
-    prompt = f"""
-以下の情報は乃木坂46に関する最新ニュースです。
-ファン向けに、わかりやすく・読みやすく・丁寧に要点を3〜5個にまとめてください。
-
-{text}
-"""
-
-    completion = ai.chat.completions.create(
-        model="gpt-4.1",
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    return completion.choices[0].message.content
-
-
-# ----------- /nogi_news コマンド -----------
-@tree.command(name="nogi_news", description="最新の乃木坂ニュースを取得します")
-async def nogi_news(interaction: discord.Interaction):
-    await interaction.response.defer()
-
-    articles = fetch_nogi_news()
-    summary = summarize_articles(articles)
-
-    await interaction.followup.send(summary)
-
-
-# ----------- /chat コマンド（ChatGPTと会話） -----------
-@tree.command(name="chat", description="AIと会話します")
-async def chat(interaction: discord.Interaction, message: str):
-    await interaction.response.defer()
-
-    try:
-        completion = ai.chat.completions.create(
-            model="gpt-4.1",
-            messages=[
-                {"role": "system", "content": "あなたは優しいアシスタントです。"},
-                {"role": "user", "content": message}
-            ],
-        )
-        reply = completion.choices[0].message.content
-
-    except Exception as e:
-        reply = f"OpenAI API エラー: {e}"
-
-    await interaction.followup.send(reply)
-
-
-# ----------- 起動処理 -----------
 @client.event
 async def on_ready():
-    await tree.sync()
-    print("Nogizaka News Bot（GPT-4.1）起動完了")
+    print(f"Logged in as {client.user} (ready)")
 
+@client.event
+async def on_message(message: discord.Message):
+    # Bot自身の発言は無視
+    if message.author.bot:
+        return
+
+    # DM か、Botへのメンションのときだけ反応（荒れ防止）
+    is_dm = isinstance(message.channel, discord.DMChannel)
+    is_mentioned = client.user in message.mentions if client.user else False
+    if not (is_dm or is_mentioned):
+        return
+
+    # メンション部分を除去
+    user_text = message.content
+    if is_mentioned and client.user:
+        user_text = user_text.replace(f"<@{client.user.id}>", "").strip()
+        user_text = user_text.replace(f"<@!{client.user.id}>", "").strip()
+
+    if not user_text:
+        await message.reply("何について話す？（例：今日の乃木坂ニュース、推しメン相談、など）")
+        return
+
+    async with message.channel.typing():
+        cid = message.channel.id
+        history = conversation.get(cid, [])
+
+        history.append({"role": "user", "content": user_text})
+        history = history[-MAX_TURNS:]
+
+        try:
+            completion = ai.chat.completions.create(
+                model="gpt-4.1",
+                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
+            )
+            reply = completion.choices[0].message.content.strip()
+        except Exception as e:
+            await message.reply(f"OpenAI API エラー: {e}")
+            return
+
+        history.append({"role": "assistant", "content": reply})
+        history = history[-MAX_TURNS:]
+        conversation[cid] = history
+
+    await message.reply(reply)
 
 client.run(DISCORD_TOKEN)
