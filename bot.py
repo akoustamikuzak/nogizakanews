@@ -132,8 +132,6 @@ async def on_message(message: discord.Message):
 
     await message.reply(reply)
 
-client.run(DISCORD_TOKEN)
-
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -146,3 +144,5 @@ def run_dummy_server():
     server.serve_forever()
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
+
+client.run(DISCORD_TOKEN)
