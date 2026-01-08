@@ -1,148 +1,72 @@
-import os
-import re
-import feedparser
-import discord
-import threading
-import os
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from dotenv import load_dotenv
-from openai import OpenAI
-from datetime import datetime, timezone, timedelta
+import time
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
-load_dotenv()
+BASE = "https://www.nogizaka46.com"
+HOME = "https://www.nogizaka46.com/s/n46/?ima=0"
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (NogizakaDiscordBot; +https://github.com/akoustamikuzak/nogizakanews)"
+}
 
-intents = discord.Intents.default()
-intents.message_content = True
-client = discord.Client(intents=intents)
+def fetch_official_news_urls(limit: int = 8):
+    """
+    公式トップの News セクションから /s/n46/news/detail/XXXX を拾う
+    """
+    r = requests.get(HOME, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    html = r.text
 
-ai = OpenAI(api_key=OPENAI_API_KEY)
+    soup = BeautifulSoup(html, "lxml")
 
-# チャンネル単位の簡易履歴
-conversation = {}  # {channel_id: [ {role, content}, ... ]}
-MAX_TURNS = 12
+    urls = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/s/n46/news/detail/" in href:
+            full = urljoin(BASE, href)
+            if full not in urls:
+                urls.append(full)
+        if len(urls) >= limit:
+            break
 
-JST = timezone(timedelta(hours=9))
+    return urls
 
-def today_jst_str():
-    return datetime.now(JST).strftime("%Y-%m-%d")
+def fetch_official_news_detail(url: str):
+    """
+    ニュース詳細ページから title/date/body をざっくり抽出（多少HTMLが変わっても耐える）
+    """
+    r = requests.get(url, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
 
-def fetch_google_news_rss(query: str, n: int = 5):
-    # Google News RSS（APIキー不要）
-    rss_url = f"https://news.google.com/rss/search?q={query}&hl=ja&gl=JP&ceid=JP:ja"
-    feed = feedparser.parse(rss_url)
+    # タイトル（ページ内のh1が安定しやすい）
+    h1 = soup.find("h1")
+    title = h1.get_text(strip=True) if h1 else ""
+
+    # 日付（ページ中に YYYY.MM.DD が出るので正規表現で拾う）
+    import re
+    m = re.search(r"\b(20\d{2}\.\d{2}\.\d{2})\b", soup.get_text(" ", strip=True))
+    date = m.group(1) if m else ""
+
+    # 本文：まずは「本文っぽい」長めテキストを拾う（厳密セレクタに依存しない）
+    # ※必要ならここはCSSセレクタで精密化できる
+    texts = [p.get_text(" ", strip=True) for p in soup.find_all(["p", "div"])]
+
+    # タイトル/フッタ等を避けつつ、長めの塊を本文候補に
+    body_candidates = [t for t in texts if len(t) >= 40 and "LATEST NEWS" not in t]
+    body = max(body_candidates, key=len) if body_candidates else ""
+
+    return {"source": "official", "title": title, "date": date, "url": url, "body": body}
+
+def fetch_official_news(limit: int = 5, sleep_sec: float = 0.6):
+    urls = fetch_official_news_urls(limit=limit)
     items = []
-    for entry in feed.entries[:n]:
-        items.append({
-            "title": entry.get("title", ""),
-            "url": entry.get("link", ""),
-            "source": entry.get("source", {}).get("title", "") if isinstance(entry.get("source"), dict) else ""
-        })
-    return items
-
-def looks_like_news_request(text: str) -> bool:
-    # 「ニュース」「今日」「最新」などが入ってたらニュース要求とみなす（雑でOK）
-    keywords = ["ニュース", "最新", "今日", "速報", "話題", "トピック", "まとめ"]
-    return any(k in text for k in keywords)
-
-def format_news_list(items):
-    if not items:
-        return "（ニュースが取得できませんでした）"
-    lines = []
-    for i, it in enumerate(items, 1):
-        title = it["title"].strip()
-        url = it["url"].strip()
-        lines.append(f"{i}. {title}\n{url}")
-    return "\n\n".join(lines)
-
-def system_prompt():
-    return (
-        f"今日は{today_jst_str()}（日本時間）です。"
-        "あなたはDiscord上でユーザーと自然に会話するアシスタントです。"
-        "日本語で会話的に返してください。"
-        "最新情報が必要な話題（今日のニュース等）は、ユーザーが提示したニュース一覧（タイトル+URL）を根拠に答えてください。"
-        "ニュース本文が無い場合は、タイトルとURLから“断定せず”に要点を整理してください。"
-        "不確かなことは不確かだと短く明示してください。"
-    )
-
-@client.event
-async def on_ready():
-    print(f"Logged in as {client.user} (ready)")
-
-@client.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-
-    is_dm = isinstance(message.channel, discord.DMChannel)
-    is_mentioned = client.user in message.mentions if client.user else False
-    if not (is_dm or is_mentioned):
-        return
-
-    user_text = message.content
-    if is_mentioned and client.user:
-        user_text = user_text.replace(f"<@{client.user.id}>", "").strip()
-        user_text = user_text.replace(f"<@!{client.user.id}>", "").strip()
-
-    if not user_text:
-        await message.reply("何について話す？（例：@乃木坂BOT 今日のニュース / 推しメン相談）")
-        return
-
-    async with message.channel.typing():
-        cid = message.channel.id
-        history = conversation.get(cid, [])
-        history = history[-MAX_TURNS:]
-
-        # ★ ニュース要求ならRSSを取得して“材料”を追加
-        if looks_like_news_request(user_text):
-            # 乃木坂に寄せる（ユーザーが別キーワードを入れてたらそれを優先）
-            q = user_text.strip()
-            if len(q) < 2 or q in ["ニュース", "最新ニュース", "今日のニュース"]:
-                q = "乃木坂46 今日"
-
-            news = fetch_google_news_rss(q, n=6)
-            news_block = "【取得したニュース一覧（タイトル+URL）】\n" + format_news_list(news)
-
-            # ユーザーの質問＋ニュース材料をセットで投げる
-            combined = (
-                f"ユーザーの要望: {user_text}\n\n"
-                f"{news_block}\n\n"
-                "このニュース一覧を根拠に、会話として自然に答えて。"
-            )
-            history.append({"role": "user", "content": combined})
-        else:
-            history.append({"role": "user", "content": user_text})
-
-        history = history[-MAX_TURNS:]
-
+    for u in urls:
         try:
-            completion = ai.chat.completions.create(
-                model="gpt-4.1",
-                messages=[{"role": "system", "content": system_prompt()}] + history,
-            )
-            reply = completion.choices[0].message.content.strip()
-        except Exception as e:
-            await message.reply(f"OpenAI API エラー: {e}")
-            return
-
-        history.append({"role": "assistant", "content": reply})
-        conversation[cid] = history[-MAX_TURNS:]
-
-    await message.reply(reply)
-
-class DummyHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-def run_dummy_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), DummyHandler)
-    server.serve_forever()
-
-threading.Thread(target=run_dummy_server, daemon=True).start()
-
-client.run(DISCORD_TOKEN)
+            items.append(fetch_official_news_detail(u))
+        except Exception:
+            # 1件落ちても全体は返す
+            continue
+        time.sleep(sleep_sec)  # 負荷をかけない
+    return items
